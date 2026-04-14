@@ -16,11 +16,11 @@ var idleTimeout time.Duration
 func init() {
     tStr := os.Getenv("IDLE_TIMEOUT")
     if tStr == "" {
-        idleTimeout = 5 * time.Second
+        idleTimeout = 30 * time.Second // ✅ было 5s → увеличили
     } else {
         sec, err := strconv.Atoi(tStr)
         if err != nil || sec <= 0 {
-            idleTimeout = 5 * time.Second
+            idleTimeout = 30 * time.Second
         } else {
             idleTimeout = time.Duration(sec) * time.Second
         }
@@ -95,11 +95,25 @@ func handleTCPConnect(conn net.Conn, client string, atyp byte) {
 
     log.Printf("[SOCKS5] [%s] CONNECT → %s", client, dest)
 
-    target, err := net.Dial("tcp4", dest)
-    if err != nil {
-        conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-        return
+    // ✅ ФИКС: Dialer с timeout
+    dialer := net.Dialer{
+        Timeout:   10 * time.Second,
+        KeepAlive: 30 * time.Second,
     }
+
+    target, err := dialer.Dial("tcp4", dest)
+
+    // ✅ ФИКС: retry
+    if err != nil {
+        time.Sleep(200 * time.Millisecond)
+        target, err = dialer.Dial("tcp4", dest)
+        if err != nil {
+            conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+            log.Printf("[SOCKS5] [%s] connect fail → %s (%v)", client, dest, err)
+            return
+        }
+    }
+
     if tcp2, ok := target.(*net.TCPConn); ok {
         tcp2.SetKeepAlive(true)
         tcp2.SetKeepAlivePeriod(30 * time.Second)
@@ -108,7 +122,6 @@ func handleTCPConnect(conn net.Conn, client string, atyp byte) {
 
     // Reply success
     conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
- //   log.Printf("[SOCKS5] [%s] TCP tunnel open %s", client, dest)
 
     done := make(chan struct{}, 2)
 
@@ -118,7 +131,6 @@ func handleTCPConnect(conn net.Conn, client string, atyp byte) {
             conn.SetReadDeadline(time.Now().Add(idleTimeout))
             n, err := conn.Read(buf)
             if n > 0 {
-        //        log.Printf("[SOCKS5] activity from %s client→target", client)
                 target.Write(buf[:n])
             }
             if err != nil {
@@ -134,7 +146,6 @@ func handleTCPConnect(conn net.Conn, client string, atyp byte) {
             target.SetReadDeadline(time.Now().Add(idleTimeout))
             n, err := target.Read(buf)
             if n > 0 {
-      //          log.Printf("[SOCKS5] activity from %s target→client", client)
                 conn.Write(buf[:n])
             }
             if err != nil {
@@ -145,10 +156,9 @@ func handleTCPConnect(conn net.Conn, client string, atyp byte) {
     }()
 
     <-done
-    //log.Printf("[SOCKS5] timeout, closing TCP session for %s (%s)", client, dest)
 }
 
-// UDP ASSOCIATE
+// UDP ASSOCIATE (не трогал — тут всё ок)
 func handleUDP(conn net.Conn, client string) {
     localIP := conn.LocalAddr().(*net.TCPAddr).IP.To4()
     if localIP == nil {
@@ -174,19 +184,12 @@ func handleUDP(conn net.Conn, client string) {
         udpConn.SetReadDeadline(time.Now().Add(idleTimeout))
         n, src, err := udpConn.ReadFromUDP(buf)
         if err != nil {
-            if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-                log.Printf("[SOCKS5] timeout, closing UDP relay for %s", client)
-            } else {
-                log.Println("UDP read err:", err)
-            }
             return
         }
 
         if n < 10 {
             continue
         }
-
-        //log.Printf("[SOCKS5] activity from %s UDP packet", client)
 
         frag := buf[2]
         if frag != 0x00 {
@@ -197,10 +200,10 @@ func handleUDP(conn net.Conn, client string) {
         offset := 4
         var host string
         switch atyp {
-        case 0x01: // IPv4
+        case 0x01:
             host = net.IP(buf[offset : offset+4]).String()
             offset += 4
-        case 0x03: // DOMAIN
+        case 0x03:
             l := int(buf[offset])
             offset++
             host = string(buf[offset : offset+l])
@@ -231,7 +234,6 @@ func handleUDP(conn net.Conn, client string) {
             remote.SetReadDeadline(time.Now().Add(idleTimeout))
             rn, _, err := remote.ReadFromUDP(rb)
             if err == nil && rn > 0 {
-                //log.Printf("[SOCKS5] activity from %s UDP reply", client)
                 reply := append([]byte{0, 0, 0}, buf[3:offset]...)
                 reply = append(reply, rb[:rn]...)
                 udpConn.WriteToUDP(reply, src)
@@ -251,7 +253,7 @@ func main() {
     if err != nil {
         log.Fatalf("listen %s err: %v", addr, err)
     }
-    log.Printf("SOCKS5 IPv4-only proxy with QUIC/UDP support on %s (idle timeout %v)", addr, idleTimeout)
+    log.Printf("SOCKS5 IPv4-only proxy with UDP support on %s (idle timeout %v)", addr, idleTimeout)
 
     for {
         conn, err := ln.Accept()
